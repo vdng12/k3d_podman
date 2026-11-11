@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# k3dctl — run k3d clusters on rootful Podman (Void Linux / runit, no systemd)
+#
+# usage: k3dctl {create|start|stop|delete|status|kc|api-up|api-down} [-c k3d.yaml] [-n name]
+#
+#   create    preflight, start Podman API, create cluster from config, pull kubeconfig, wait Ready
+#   start     start a stopped cluster (refreshes kubeconfig, ports may change)
+#   stop      stop cluster containers, then stop the Podman API (frees CPU/RAM)
+#   delete    delete cluster + its network + its kubeconfig, then stop the API
+#   status    show node containers and k8s node status
+#   kc        (re)write ~/.kube/k3d-<name>.yaml
+#   api-up / api-down   just the Podman API socket
+set -euo pipefail
+
+SOCK=/run/podman/podman.sock
+CFG=k3d.yaml
+NAME=""
+
+cmd=${1:-}; shift || true
+while getopts "c:n:" opt; do
+  case $opt in
+    c) CFG=$OPTARG ;;
+    n) NAME=$OPTARG ;;
+    *) exit 2 ;;
+  esac
+done
+
+# cluster name: -n flag > metadata.name in config > "lab"
+if [[ -z $NAME ]]; then
+  if [[ -f $CFG ]]; then
+    NAME=$(awk '/^metadata:/{f=1;next} f&&/^[^ ]/{f=0} f&&/name:/{print $2;exit}' "$CFG")
+  fi
+  NAME=${NAME:-lab}
+fi
+
+KC="$HOME/.kube/k3d-$NAME.yaml"
+K3D_BIN=$(type -P k3d) || { echo "k3d not found in PATH" >&2; exit 1; }
+
+log() { printf '\e[1;34m==>\e[0m %s\n' "$*"; }
+die() { printf '\e[1;31mxx\e[0m %s\n' "$*" >&2; exit 1; }
+
+# k3d as root, pointed at Podman's socket (sudo strips env, so pass it explicitly)
+rk3d() { sudo DOCKER_HOST="unix://$SOCK" DOCKER_SOCK="$SOCK" "$K3D_BIN" "$@"; }
+
+api_alive() { sudo podman --remote --url "unix://$SOCK" info >/dev/null 2>&1; }
+
+api_up() {
+  api_alive && return 0
+  log "starting Podman API on $SOCK"
+  if [[ -e /var/service/podman-api ]]; then
+    sudo sv up podman-api
+  else
+    sudo mkdir -p /run/podman
+    sudo -b sh -c "exec podman system service --time=0 unix://$SOCK >/tmp/podman-api.log 2>&1"
+  fi
+  for _ in $(seq 1 30); do api_alive && return 0; sleep 0.5; done
+  die "Podman API did not come up (see /tmp/podman-api.log or svlogtail)"
+}
+
+api_down() {
+  log "stopping Podman API"
+  if [[ -e /var/service/podman-api ]]; then
+    sudo sv down podman-api
+  else
+    sudo pkill -f "podman system service" || true
+  fi
+}
+
+preflight() {
+  # k3s inside the node containers needs shared mount propagation on /
+  if [[ $(findmnt -no PROPAGATION /) != shared* ]]; then
+    log "making / rshared (add 'mount --make-rshared /' to /etc/rc.local to persist)"
+    sudo mount --make-rshared /
+  fi
+  for b in catatonit aardvark-dns netavark; do
+    [[ -x /usr/libexec/podman/$b ]] || command -v "$b" >/dev/null \
+      || die "missing $b — sudo xbps-install -S $b"
+  done
+}
+
+cluster_exists() { rk3d cluster get "$NAME" >/dev/null 2>&1; }
+
+pull_kc() {
+  mkdir -p "$HOME/.kube"
+  rk3d kubeconfig get "$NAME" > "$KC"
+  chmod 600 "$KC"
+  log "kubeconfig: $KC (context k3d-$NAME)"
+}
+
+wait_ready() {
+  log "waiting for nodes to be Ready"
+  KUBECONFIG=$KC kubectl wait --for=condition=Ready nodes --all --timeout=180s
+}
+
+sudo -v   # ask for the password once, up front
+
+case $cmd in
+  create)
+    preflight
+    api_up
+    if cluster_exists; then
+      log "cluster '$NAME' already exists — use: k3dctl start"
+    else
+      [[ -f $CFG ]] || die "config $CFG not found"
+      # a network left by a failed attempt may lack DNS; DNS is fixed at network creation
+      sudo podman network rm "k3d-$NAME" >/dev/null 2>&1 || true
+      log "creating cluster '$NAME' from $CFG"
+      rk3d cluster create --config "$CFG"
+    fi
+    pull_kc
+    wait_ready
+    ;;
+  start)
+    preflight
+    api_up
+    rk3d cluster start "$NAME"
+    pull_kc
+    wait_ready
+    ;;
+  stop)
+    api_up
+    rk3d cluster stop "$NAME"
+    api_down
+    ;;
+  delete)
+    api_up
+    rk3d cluster delete "$NAME"
+    sudo podman network rm "k3d-$NAME" >/dev/null 2>&1 || true
+    rm -f "$KC"
+    api_down
+    ;;
+  status)
+    sudo podman ps -a --filter "name=k3d-$NAME" --format 'table {{.Names}}\t{{.Status}}'
+    if [[ -f $KC ]]; then KUBECONFIG=$KC kubectl get nodes -o wide 2>/dev/null || true; fi
+    ;;
+  kc)       api_up; pull_kc ;;
+  api-up)   api_up ;;
+  api-down) api_down ;;
+  *)
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

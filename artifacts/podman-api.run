@@ -1,0 +1,10 @@
+#!/bin/sh
+# runit service for the rootful Podman API socket (used by k3d)
+# install:
+#   sudo mkdir -p /etc/sv/podman-api
+#   sudo cp podman-api.run /etc/sv/podman-api/run && sudo chmod +x /etc/sv/podman-api/run
+#   sudo touch /etc/sv/podman-api/down        # supervised, but not started at boot
+#   sudo ln -s /etc/sv/podman-api /var/service/
+# use: sudo sv up podman-api / sudo sv down podman-api / sv status podman-api
+mkdir -p /run/podman                          # /run is tmpfs, recreated every boot
+exec podman system service --time=0 unix:///run/podman/podman.sock 2>&1
