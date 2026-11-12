@@ -99,7 +99,7 @@ kubectl, same manifests, same API.
 
 | Path | Description |
 |---|---|
-| `k3d.yaml` | k3d cluster definition (1 server, 2 agents, port 8080:80) |
+| `artifacts/k3d.yaml` | k3d cluster definition (1 server, 2 agents, port 8080:80) |
 | `artifacts/podman-api.run` | Runit service for rootful Podman API socket |
 | `artifacts/k3dctl` | Cluster lifecycle wrapper script |
 | `artifacts/k3d.bashrc` | Shell integration (KUBECONFIG, k3d wrapper, k alias) |
